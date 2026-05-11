@@ -157,7 +157,7 @@ pub const EXPECTED_RISK_PARAMS_SIZE: usize = 184;
 /// v12.17: Account grew from 320 to 352 bytes (removed account_id, entry_price,
 /// fees_earned_total, funding_index, position_size, last_partial_liquidation_slot,
 /// warmup_started_at_slot, warmup_slope_per_step; added f_snap and two warmup buckets).
-pub const EXPECTED_ACCOUNT_SIZE: usize = 352;
+pub const EXPECTED_ACCOUNT_SIZE: usize = 408;
 
 // All structs are 8-byte aligned because every 128-bit field uses the
 // [u64; 2]-backed U128/I128 wrappers instead of native i128/u128.
@@ -477,6 +477,15 @@ pub struct Account {
 
     pub adl_epoch_snap: u64,
 
+    /// Wave 11b / KL-FORK-ENGINE-B-TRACKING-1 (PARTIALLY REVOKED, mirror).
+    /// Per-account B-index loss-weight + snapshot state (engine PR #97 @
+    /// `1fa22d9`). Native `u128` upstream; wrapped here as `U128` (8-byte
+    /// aligned) per the NFT mirror convention.
+    pub loss_weight: U128,
+    pub b_snap: U128,
+    pub b_rem: U128,
+    pub b_epoch_snap: u64,
+
     pub matcher_program: [u8; 32],
     pub matcher_context: [u8; 32],
 
@@ -549,20 +558,20 @@ const _: () = assert!(ACCT_OFF_ADL_A_BASIS == 72);
 const _: () = assert!(ACCT_OFF_ADL_K_SNAP == 88);
 const _: () = assert!(ACCT_OFF_F_SNAP == 104);
 const _: () = assert!(ACCT_OFF_ADL_EPOCH_SNAP == 120);
-const _: () = assert!(ACCT_OFF_MATCHER_PROGRAM == 128);
-const _: () = assert!(ACCT_OFF_MATCHER_CONTEXT == 160);
-const _: () = assert!(ACCT_OFF_OWNER == 192);
-const _: () = assert!(ACCT_OFF_FEE_CREDITS == 224);
-const _: () = assert!(ACCT_OFF_SCHED_PRESENT == 240);
-const _: () = assert!(ACCT_OFF_SCHED_REMAINING_Q == 248);
-const _: () = assert!(ACCT_OFF_SCHED_ANCHOR_Q == 264);
-const _: () = assert!(ACCT_OFF_SCHED_START_SLOT == 280);
-const _: () = assert!(ACCT_OFF_SCHED_HORIZON == 288);
-const _: () = assert!(ACCT_OFF_SCHED_RELEASE_Q == 296);
-const _: () = assert!(ACCT_OFF_PENDING_PRESENT == 312);
-const _: () = assert!(ACCT_OFF_PENDING_REMAINING_Q == 320);
-const _: () = assert!(ACCT_OFF_PENDING_HORIZON == 336);
-const _: () = assert!(ACCT_OFF_PENDING_CREATED_SLOT == 344);
+const _: () = assert!(ACCT_OFF_MATCHER_PROGRAM == 184);
+const _: () = assert!(ACCT_OFF_MATCHER_CONTEXT == 216);
+const _: () = assert!(ACCT_OFF_OWNER == 248);
+const _: () = assert!(ACCT_OFF_FEE_CREDITS == 280);
+const _: () = assert!(ACCT_OFF_SCHED_PRESENT == 296);
+const _: () = assert!(ACCT_OFF_SCHED_REMAINING_Q == 304);
+const _: () = assert!(ACCT_OFF_SCHED_ANCHOR_Q == 320);
+const _: () = assert!(ACCT_OFF_SCHED_START_SLOT == 336);
+const _: () = assert!(ACCT_OFF_SCHED_HORIZON == 344);
+const _: () = assert!(ACCT_OFF_SCHED_RELEASE_Q == 352);
+const _: () = assert!(ACCT_OFF_PENDING_PRESENT == 368);
+const _: () = assert!(ACCT_OFF_PENDING_REMAINING_Q == 376);
+const _: () = assert!(ACCT_OFF_PENDING_HORIZON == 392);
+const _: () = assert!(ACCT_OFF_PENDING_CREATED_SLOT == 400);
 
 // ════════════════════════════════════════════════════════════════════════════
 // RiskEngine — v12.17 (SBF)
@@ -693,6 +702,27 @@ pub struct RiskEngine {
     pub phantom_dust_certified_short_q: U128,
     pub phantom_dust_potential_long_q: U128,
     pub phantom_dust_potential_short_q: U128,
+
+    /// Wave 11b / KL-FORK-ENGINE-B-TRACKING-1 (PARTIALLY REVOKED, mirror).
+    /// B-index bankruptcy-residual subsystem state (engine PR #97 @
+    /// `1fa22d9`, spec §1.2 / §2.2). 14 × U128 + 3 × U128 + 1 × u8 (+
+    /// 7 trailing pad to align next u64). Mirror's `U128` is 8-byte
+    /// aligned, matching the BPF u128 layout.
+    pub b_long_num: U128,
+    pub b_short_num: U128,
+    pub b_epoch_start_long_num: U128,
+    pub b_epoch_start_short_num: U128,
+    pub loss_weight_sum_long: U128,
+    pub loss_weight_sum_short: U128,
+    pub social_loss_remainder_long_num: U128,
+    pub social_loss_remainder_short_num: U128,
+    pub social_loss_dust_long_num: U128,
+    pub social_loss_dust_short_num: U128,
+    pub explicit_unallocated_loss_long: U128,
+    pub explicit_unallocated_loss_short: U128,
+    pub explicit_unallocated_protocol_loss: U128,
+    pub explicit_unallocated_loss_saturated: u8,
+    pub _b_tracking_pad: [u8; 7],
 
     pub materialized_account_count: u64,
 
@@ -867,7 +897,7 @@ pub const EXPECTED_RISK_ENGINE_SIZE: usize = {
     // Wave 6c (engine PR #95 @ 8a8776e): phantom-dust 4-field schema
     // swap (2 × U128 → 4 × U128 per side; +32 bytes net at 8-byte
     // alignment). Mirror grows to 912.
-    let fixed_prefix: usize = 912;
+    let fixed_prefix: usize = 1128;
     let used_bytes: usize = 8 * BITMAP_WORDS;
     // num_used_accounts(u16) + free_head(u16) = 4 bytes; next u64 boundary = 8 bytes total
     let mid: usize = 4;
@@ -901,7 +931,7 @@ const _: () = assert!(ENGINE_REL_MAINT_MARGIN_BPS == 32); // params at 32, maint
 const _: () = assert!(ENGINE_REL_MAX_ACCOUNTS_FIELD == 32 + 24); // params+24
 const _: () = assert!(ENGINE_REL_C_TOT == 336);
 const _: () = assert!(ENGINE_REL_PNL_POS_TOT == 352);
-const _: () = assert!(ENGINE_REL_NEG_PNL_ACCOUNT_COUNT == 648);
+const _: () = assert!(ENGINE_REL_NEG_PNL_ACCOUNT_COUNT == 864);
 // Wave 1 (engine PR #91 @ 8e3df3db): +16 bytes (oracle_target_price_e6 + oracle_target_publish_time).
 // Wave 4a (engine PR #92 @ de6e1686): +8 bytes (bankrupt-close gate + 6-byte align pad).
 // Wave 5a (engine PR #93 @ 9d167a62): +40 bytes useful + 8 bytes u128 align pad
@@ -926,11 +956,11 @@ const _: () = assert!(ENGINE_REL_NEG_PNL_ACCOUNT_COUNT == 648);
 //   Wave 6c +32: 2 new U128 phantom_dust_certified fields inserted
 //               BEFORE the renamed phantom_dust_potential pair. All
 //               downstream offsets shift +32.
-const _: () = assert!(ENGINE_REL_LAST_ORACLE_PRICE == 824);
-const _: () = assert!(ENGINE_REL_FUND_PX_LAST == 832);
-const _: () = assert!(ENGINE_REL_F_LONG_NUM == 848);
-const _: () = assert!(ENGINE_REL_F_SHORT_NUM == 864);
-const _: () = assert!(ENGINE_REL_USED == 912);
+const _: () = assert!(ENGINE_REL_LAST_ORACLE_PRICE == 1040);
+const _: () = assert!(ENGINE_REL_FUND_PX_LAST == 1048);
+const _: () = assert!(ENGINE_REL_F_LONG_NUM == 1064);
+const _: () = assert!(ENGINE_REL_F_SHORT_NUM == 1080);
+const _: () = assert!(ENGINE_REL_USED == 1128);
 
 // ════════════════════════════════════════════════════════════════════════════
 // Slab geometry — verbatim from percolator-prog/src/lib.rs:47-72
@@ -984,13 +1014,13 @@ const _: () = assert!(SLAB_OFF_MAINT_MARGIN_BPS == 584 + 32);   // 616
 const _: () = assert!(SLAB_OFF_MAX_ACCOUNTS == 584 + 56);        // 640
 const _: () = assert!(SLAB_OFF_C_TOT == 584 + 336);              // 920
 const _: () = assert!(SLAB_OFF_PNL_POS_TOT == 584 + 352);        // 936
-const _: () = assert!(SLAB_OFF_NEG_PNL_ACCOUNT_COUNT == 584 + 648); // 1232
+const _: () = assert!(SLAB_OFF_NEG_PNL_ACCOUNT_COUNT == 584 + 864); // 1232
 // Wave 1 + Wave 4a + Wave 5a + Wave 5b cumulative effective shift +176
 // bytes downstream of `neg_pnl_account_count` (includes natural u128
 // alignment pads inserted by the Rust compiler):
 // Slab offsets follow ENGINE_OFF + ENGINE_REL_*. ENGINE_OFF = 584.
-const _: () = assert!(SLAB_OFF_LAST_ORACLE_PRICE == 584 + 824);  // 1408
-const _: () = assert!(SLAB_OFF_FUND_PX_LAST == 584 + 832);       // 1416
-const _: () = assert!(SLAB_OFF_F_LONG_NUM == 584 + 848);         // 1432
-const _: () = assert!(SLAB_OFF_F_SHORT_NUM == 584 + 864);        // 1448
-const _: () = assert!(SLAB_OFF_USED == 584 + 912);               // 1496
+const _: () = assert!(SLAB_OFF_LAST_ORACLE_PRICE == 584 + 1040);  // 1408
+const _: () = assert!(SLAB_OFF_FUND_PX_LAST == 584 + 1048);       // 1416
+const _: () = assert!(SLAB_OFF_F_LONG_NUM == 584 + 1064);         // 1432
+const _: () = assert!(SLAB_OFF_F_SHORT_NUM == 584 + 1080);        // 1448
+const _: () = assert!(SLAB_OFF_USED == 584 + 1128);               // 1496
