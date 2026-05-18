@@ -1269,3 +1269,320 @@ fn test_slot_reused_error_code() {
         "SlotReused must be error code 20"
     );
 }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// AUDIT POC — FINDING 1: legitimate-transfer brick
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Bug claim: After any Token-2022 NFT transfer of an OPEN position, the new
+// holder cannot Burn, SettleFunding, or GetPositionValue — each rejects with
+// `NftError::SlotReused`.
+//
+// Root cause: `transfer_hook::process_execute` CPIs into percolator-prog
+// tag 69, which mutates `slab.Account[idx].owner` to the destination wallet.
+// On the way out, the hook writes ONLY `nft_state.last_funding_index_e18`
+// back to the PDA — it does NOT update `nft_state.position_owner`. PERC-N1's
+// slot-reuse guard in Burn / SettleFunding / GetPositionValue then sees the
+// legitimate post-transfer `position.owner == Bob` differ from the stale
+// `nft_state.position_owner == Alice`, and rejects.
+//
+// The two tests below reproduce the bug without invoking any CPI (we hand-
+// build the post-transfer on-chain state and feed it to `process(...)`).
+//
+//   test_audit_finding1_settle_bricked_after_transfer:
+//     PROVES THE BUG — asserts that SettleFunding returns SlotReused for
+//     a legitimately-transferred OPEN position.
+//
+//   test_audit_finding1_fix_unblocks_settle:
+//     PROVES THE FIX — runs the same scenario with `position_owner` set
+//     to the new holder (as the proposed hook fix would set it) and
+//     asserts the slot-reuse check no longer fires.
+//
+// Both tests use SettleFunding (tag 2) rather than Burn (tag 1) because:
+//   * the brick scenario requires `position.size > 0` (the position is still
+//     OPEN — that is the whole point of the secondary market)
+//   * Burn rejects an open position with `PositionNotClosed` regardless, so
+//     it can't cleanly demonstrate the brick on an open position
+//   * SettleFunding's ordering puts the slot-reuse check BEFORE the size
+//     check, so it surfaces the bug on the open-position path directly.
+
+/// Helper: build a V0-layout slab with an OPEN position at slot 0 owned by
+/// `owner`. Encodes position_basis_q (lo at +80), entry_price (+96, u64),
+/// and is_long via the I128 hi-word at +88 (positive ⇒ long).
+fn build_v0_slab_open_position(
+    owner: &solana_sdk::pubkey::Pubkey,
+    position_size: u64,
+    entry_price_e6: u64,
+    is_long: bool,
+) -> Vec<u8> {
+    let max_accounts: u16 = 1;
+    let v0_bitmap_off: usize = 608;
+    let bitmap_bytes: usize = 1;
+    let v0_account_size: usize = 240;
+    let total = v0_bitmap_off + bitmap_bytes + max_accounts as usize * v0_account_size;
+    let mut data = vec![0u8; total];
+    // SLAB_MAGIC
+    data[0..8].copy_from_slice(&0x5045_5243_4F4C_4154u64.to_le_bytes());
+    // max_accounts header (V0 layout detection reads u16 here)
+    data[8..10].copy_from_slice(&max_accounts.to_le_bytes());
+    // Bitmap bit 0 set ⇒ slot 0 is allocated.
+    data[v0_bitmap_off] = 0x01;
+    let accounts_off = v0_bitmap_off + bitmap_bytes;
+    // capital (U128 lo at +8) must be > 0 so the v12.17 fallback wouldn't bail.
+    data[accounts_off + 8..accounts_off + 16].copy_from_slice(&1_000_000u64.to_le_bytes());
+    // kind = 0 (User) — already zeroed.
+    // position_size: I128 sign+magnitude at +80(lo)/+88(hi). For V0 we use
+    // sign+magnitude: hi-word bit 63 clear ⇒ long, set ⇒ short.
+    data[accounts_off + 80..accounts_off + 88].copy_from_slice(&position_size.to_le_bytes());
+    let hi: u64 = if is_long { 0 } else { 0x8000_0000_0000_0000 };
+    data[accounts_off + 88..accounts_off + 96].copy_from_slice(&hi.to_le_bytes());
+    // entry_price at +96.
+    data[accounts_off + 96..accounts_off + 104].copy_from_slice(&entry_price_e6.to_le_bytes());
+    // owner at +184.
+    let owner_off = accounts_off + 184;
+    data[owner_off..owner_off + 32].copy_from_slice(owner.as_ref());
+    data
+}
+
+/// Helper: build a PositionNft PDA with full open-position snapshot.
+fn make_pda_data_open(
+    slab_key: &solana_sdk::pubkey::Pubkey,
+    nft_mint_key: &solana_sdk::pubkey::Pubkey,
+    position_owner: [u8; 32],
+    entry_price_e6: u64,
+    position_size: u64,
+    is_long: u8,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; POSITION_NFT_LEN];
+    buf[..8].copy_from_slice(&POSITION_NFT_MAGIC.to_le_bytes());
+    buf[8] = POSITION_NFT_VERSION;
+    buf[16..48].copy_from_slice(slab_key.as_ref());
+    buf[56..88].copy_from_slice(nft_mint_key.as_ref());
+    // entry_price_e6 [88..96]
+    buf[88..96].copy_from_slice(&entry_price_e6.to_le_bytes());
+    // position_size [96..104]
+    buf[96..104].copy_from_slice(&position_size.to_le_bytes());
+    // is_long [104]
+    buf[104] = is_long;
+    // account_id [152..160] = 0 (v12.17 style)
+    // position_owner [160..192]
+    buf[160..192].copy_from_slice(&position_owner);
+    buf
+}
+
+/// Drive process(tag=2, …) with a post-transfer state where Bob holds the
+/// NFT and the slab position owner is Bob, but the PDA still records Alice
+/// as `position_owner` (because the transfer hook never wrote it back).
+fn run_settle_after_legitimate_transfer(pda_position_owner: [u8; 32]) -> Result<(), solana_program::program_error::ProgramError> {
+    use percolator_nft::{
+        cpi::PERCOLATOR_MAINNET, processor::process, token2022::TOKEN_2022_PROGRAM_ID,
+    };
+    use percolator_nft::state::{mint_authority_pda, position_nft_pda};
+    use solana_program::{account_info::AccountInfo, pubkey::Pubkey};
+    use solana_sdk::pubkey::Pubkey as SdkPubkey;
+
+    let program_id = SdkPubkey::new_unique();
+    let slab_key = SdkPubkey::new_unique();
+    let nft_mint_key = SdkPubkey::new_unique();
+    // user_a originally minted the NFT. user_b just received it via a
+    // successful Token-2022 transfer; the hook has already mutated the
+    // slab to set Account[0].owner = user_b.
+    let _user_a = SdkPubkey::new_unique();
+    let user_b = SdkPubkey::new_unique();
+
+    let prog_pk = Pubkey::new_from_array(program_id.to_bytes());
+    let slab_pk = Pubkey::new_from_array(slab_key.to_bytes());
+    let nft_mint_pk = Pubkey::new_from_array(nft_mint_key.to_bytes());
+    let (pda_pk, _) = position_nft_pda(&slab_pk, 0, &prog_pk);
+    let (_mint_auth_pk, _) = mint_authority_pda(&prog_pk);
+    let holder_pk = Pubkey::new_from_array(user_b.to_bytes());
+
+    // Open position, owner = user_b (matches what tag 69 wrote at transfer time).
+    let entry_price: u64 = 50_000_000;
+    let size: u64 = 1_000_000;
+    let mut slab_data = build_v0_slab_open_position(&user_b, size, entry_price, true);
+    // PDA snapshot matches entry/is_long, but position_owner is the supplied test arg.
+    let mut pda_data = make_pda_data_open(
+        &slab_key,
+        &nft_mint_key,
+        pda_position_owner,
+        entry_price,
+        size,
+        1,
+    );
+
+    // Bob's ATA: Token-2022 owned, balance=1, owner=user_b, mint=nft_mint.
+    let mut ata_data = vec![0u8; 165];
+    ata_data[0..32].copy_from_slice(nft_mint_key.as_ref());
+    ata_data[32..64].copy_from_slice(user_b.as_ref());
+    ata_data[64..72].copy_from_slice(&1u64.to_le_bytes());
+    ata_data[108] = 1; // Initialized
+
+    let mut holder_lamports: u64 = 1_000_000;
+    let mut pda_lamports: u64 = 1_000_000;
+    let mut slab_lamports: u64 = 1_000_000;
+    let mut ata_lamports: u64 = 1_000_000;
+    let mut holder_data: Vec<u8> = vec![];
+
+    let system_program_id = solana_program::system_program::id();
+    let token_prog_id = Pubkey::new_from_array(TOKEN_2022_PROGRAM_ID.to_bytes());
+    let percolator_pk = Pubkey::new_from_array(PERCOLATOR_MAINNET.to_bytes());
+
+    let holder_ai = AccountInfo::new(
+        &holder_pk, true, false,
+        &mut holder_lamports, &mut holder_data, &system_program_id, false, 0,
+    );
+    let pda_ai = AccountInfo::new(
+        &pda_pk, false, true,
+        &mut pda_lamports, &mut pda_data, &prog_pk, false, 0,
+    );
+    let slab_ai = AccountInfo::new(
+        &slab_pk, false, false,
+        &mut slab_lamports, &mut slab_data, &percolator_pk, false, 0,
+    );
+    let ata_ai = AccountInfo::new(
+        &holder_pk, false, true,
+        &mut ata_lamports, &mut ata_data, &token_prog_id, false, 0,
+    );
+
+    // SettleFunding accounts: [holder, nft_pda, slab, holder_ata]
+    let accounts = [holder_ai, pda_ai, slab_ai, ata_ai];
+    process(&prog_pk, &accounts, &[2u8])
+}
+
+/// AUDIT FINDING 1 — PROOF OF BUG.
+///
+/// A legitimate post-transfer scenario: Bob bought the NFT and now legitimately
+/// owns the underlying slab position (the hook updated slab.Account[0].owner
+/// = Bob during the transfer). He calls SettleFunding to refresh accrued
+/// funding on the PDA.
+///
+/// Expected (correct) behaviour: SettleFunding proceeds, updating
+/// `last_funding_index_e18`.
+///
+/// Observed behaviour: SettleFunding rejects with `SlotReused` because the
+/// transfer hook never updated `nft_state.position_owner` to track the
+/// new holder.
+#[test]
+fn test_audit_finding1_settle_bricked_after_transfer() {
+    use percolator_nft::error::NftError;
+    use solana_sdk::pubkey::Pubkey as SdkPubkey;
+
+    // The PDA still records the original minter as position_owner because
+    // the hook never updated it after the transfer. Any non-zero pubkey
+    // that differs from user_b reproduces the brick.
+    let stale_position_owner = SdkPubkey::new_unique().to_bytes();
+    let result = run_settle_after_legitimate_transfer(stale_position_owner);
+
+    let expected: solana_program::program_error::ProgramError = NftError::SlotReused.into();
+    assert_eq!(
+        result.unwrap_err(),
+        expected,
+        "FINDING 1: Bob legitimately holds the NFT and owns the slab position \
+         post-transfer, but SettleFunding rejects with SlotReused. The NFT is \
+         bricked because transfer_hook::process_execute never wrote \
+         nft_state.position_owner back to dest_wallet_pk after the tag-69 CPI."
+    );
+}
+
+/// AUDIT FINDING 1 — PROOF THAT THE PROPOSED FIX WORKS.
+///
+/// Same scenario as above, but with the PDA's `position_owner` reflecting
+/// what the proposed one-line fix to `transfer_hook::process_execute` would
+/// have written. The slot-reuse check no longer fires and SettleFunding is
+/// no longer rejected by the spurious SlotReused error.
+#[test]
+fn test_audit_finding1_fix_unblocks_settle() {
+    use percolator_nft::error::NftError;
+
+    // Mirror the user_b key derivation used inside the helper. The fix would
+    // set position_owner = dest_wallet_pk (i.e., user_b's bytes). The helper
+    // uses Pubkey::new_unique() each call so we cannot share keys across
+    // calls — instead, mark the PDA with the SAME bytes the helper writes
+    // as slab.Account[0].owner. To do this without exposing user_b out of
+    // the helper, we re-implement the helper inline with deterministic keys.
+
+    use percolator_nft::{
+        cpi::PERCOLATOR_MAINNET, processor::process, token2022::TOKEN_2022_PROGRAM_ID,
+    };
+    use percolator_nft::state::{mint_authority_pda, position_nft_pda};
+    use solana_program::{account_info::AccountInfo, pubkey::Pubkey};
+    use solana_sdk::pubkey::Pubkey as SdkPubkey;
+
+    let program_id = SdkPubkey::new_unique();
+    let slab_key = SdkPubkey::new_unique();
+    let nft_mint_key = SdkPubkey::new_unique();
+    let user_b = SdkPubkey::new_unique();
+
+    let prog_pk = Pubkey::new_from_array(program_id.to_bytes());
+    let slab_pk = Pubkey::new_from_array(slab_key.to_bytes());
+    let nft_mint_pk = Pubkey::new_from_array(nft_mint_key.to_bytes());
+    let (pda_pk, _) = position_nft_pda(&slab_pk, 0, &prog_pk);
+    let (_mint_auth_pk, _) = mint_authority_pda(&prog_pk);
+    let holder_pk = Pubkey::new_from_array(user_b.to_bytes());
+
+    let entry_price: u64 = 50_000_000;
+    let size: u64 = 1_000_000;
+    let mut slab_data = build_v0_slab_open_position(&user_b, size, entry_price, true);
+    // *** This is the only line that differs from the bug-proving test. ***
+    // With the proposed one-line hook fix, after a transfer to user_b the
+    // PDA's position_owner equals user_b's bytes.
+    let mut pda_data = make_pda_data_open(
+        &slab_key,
+        &nft_mint_key,
+        user_b.to_bytes(),
+        entry_price,
+        size,
+        1,
+    );
+
+    let mut ata_data = vec![0u8; 165];
+    ata_data[0..32].copy_from_slice(nft_mint_key.as_ref());
+    ata_data[32..64].copy_from_slice(user_b.as_ref());
+    ata_data[64..72].copy_from_slice(&1u64.to_le_bytes());
+    ata_data[108] = 1;
+
+    let mut holder_lamports: u64 = 1_000_000;
+    let mut pda_lamports: u64 = 1_000_000;
+    let mut slab_lamports: u64 = 1_000_000;
+    let mut ata_lamports: u64 = 1_000_000;
+    let mut holder_data: Vec<u8> = vec![];
+
+    let system_program_id = solana_program::system_program::id();
+    let token_prog_id = Pubkey::new_from_array(TOKEN_2022_PROGRAM_ID.to_bytes());
+    let percolator_pk = Pubkey::new_from_array(PERCOLATOR_MAINNET.to_bytes());
+
+    let holder_ai = AccountInfo::new(
+        &holder_pk, true, false,
+        &mut holder_lamports, &mut holder_data, &system_program_id, false, 0,
+    );
+    let pda_ai = AccountInfo::new(
+        &pda_pk, false, true,
+        &mut pda_lamports, &mut pda_data, &prog_pk, false, 0,
+    );
+    let slab_ai = AccountInfo::new(
+        &slab_pk, false, false,
+        &mut slab_lamports, &mut slab_data, &percolator_pk, false, 0,
+    );
+    let ata_ai = AccountInfo::new(
+        &holder_pk, false, true,
+        &mut ata_lamports, &mut ata_data, &token_prog_id, false, 0,
+    );
+
+    let accounts = [holder_ai, pda_ai, slab_ai, ata_ai];
+    let result = process(&prog_pk, &accounts, &[2u8]);
+
+    // The key assertion: the slot-reuse check must NOT fire when the PDA's
+    // position_owner is in sync with the post-transfer slab owner. SettleFunding
+    // may still return Ok or some unrelated error, but it must NOT be SlotReused.
+    let slot_reused: solana_program::program_error::ProgramError =
+        NftError::SlotReused.into();
+    match result {
+        Ok(_) => { /* fix unblocks the path entirely — best case */ }
+        Err(e) => assert_ne!(
+            e, slot_reused,
+            "Proposed fix should eliminate the spurious SlotReused error on a \
+             legitimate post-transfer SettleFunding call. Got: {:?}", e
+        ),
+    }
+}
