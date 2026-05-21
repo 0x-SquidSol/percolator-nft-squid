@@ -503,6 +503,27 @@ pub struct PositionData {
     /// Current global funding index (E18) from engine.
     /// 0 in layouts where funding index is not a single global field (v12.15+).
     pub global_funding_index_e18: i128,
+    /// Account.pnl field — Percolator's authoritative persistent PnL (spec §3.4).
+    ///
+    /// PERC-N2: Populated only on v12.17 (Account offset 24). On v12.17 the
+    /// `entry_price` field was removed, so the mark-vs-entry PnL formula used
+    /// by older layouts is undefined. Percolator itself uses this `pnl` field
+    /// directly in `account_equity_maint_raw`: `equity = capital + pnl - fee_debt`.
+    /// 0 on all other layouts (those layouts compute PnL from entry vs mark).
+    pub pnl_q: i128,
+    /// Account.fee_credits field — Percolator's persistent fee-debt ledger.
+    ///
+    /// PERC-N2: Populated only on v12.17 (Account offset 280). Convention
+    /// (per `fee_debt_u128_checked` in the percolator crate): negative
+    /// `fee_credits` means the account owes fees (`fee_debt = -fee_credits`),
+    /// positive means it has pre-paid credit. 0 on all other layouts.
+    pub fee_credits_q: i128,
+    /// `true` if the active layout is v12.17 (no Account.entry_price field).
+    ///
+    /// PERC-N2: Used by callers to branch onto the spec §3.4 equity formula
+    /// instead of the mark-PnL formula. Equivalent to checking
+    /// `layout.acct_has_entry_price == false` at read time.
+    pub is_v12_17: bool,
     /// Byte offset to the engine block within slab data (layout-dependent).
     /// Callers can use this to read further engine fields (e.g. mark_price).
     pub engine_off: usize,
@@ -513,6 +534,21 @@ pub struct PositionData {
     /// Funding index offset relative to engine_off (layout-dependent).
     pub engine_funding_index_off: usize,
 }
+
+/// Percolator's `POS_SCALE` constant — basis-quote position-size scaling
+/// factor on v12.17 layouts (spec §1.6). `effective_pos_q * mark / POS_SCALE`
+/// gives the notional in quote micro-units. Matches the constant of the
+/// same name in the upstream `percolator` crate.
+pub const POS_SCALE: u128 = 1_000_000;
+
+/// v12.17 Account field offsets used by `read_position` to populate
+/// `pnl_q` and `fee_credits_q`. Pinned at compile time against the
+/// vendored `slab_types::ACCT_OFF_*` constants so any future re-vendor
+/// that shifts these fields fails the build before mainnet.
+const V12_17_ACCT_OFF_PNL: usize = slab_types::ACCT_OFF_PNL;
+const V12_17_ACCT_OFF_FEE_CREDITS: usize = slab_types::ACCT_OFF_FEE_CREDITS;
+const _: () = assert!(V12_17_ACCT_OFF_PNL == 24);
+const _: () = assert!(V12_17_ACCT_OFF_FEE_CREDITS == 280);
 
 /// Read position data for a given user_idx from slab account data.
 pub fn read_position(slab_data: &[u8], user_idx: u16) -> Result<PositionData, ProgramError> {
@@ -612,6 +648,22 @@ pub fn read_position(slab_data: &[u8], user_idx: u16) -> Result<PositionData, Pr
         0
     };
 
+    // PERC-N2: On v12.17, read `pnl` and `fee_credits` from Account so callers
+    // can compute Percolator's authoritative `Eq_maint_raw_i = capital + pnl
+    // - fee_debt` (spec §3.4 / `account_equity_maint_raw` in the percolator
+    // crate). Legacy layouts (V0, V1D, V12_1, V12_1_EP, V12_15) keep PnL in
+    // `entry_price` × mark relationships and have these fields at different
+    // offsets or with different semantics — leave both at 0 there so the
+    // valuation path branches on `is_v12_17` and uses the legacy formula.
+    let is_v12_17 = !layout.acct_has_entry_price;
+    let (pnl_q, fee_credits_q) = if is_v12_17 {
+        let pnl = read_i128(slab_data, acct_off + V12_17_ACCT_OFF_PNL)?;
+        let fc = read_i128(slab_data, acct_off + V12_17_ACCT_OFF_FEE_CREDITS)?;
+        (pnl, fc)
+    } else {
+        (0, 0)
+    };
+
     Ok(PositionData {
         account_id,
         owner,
@@ -622,6 +674,9 @@ pub fn read_position(slab_data: &[u8], user_idx: u16) -> Result<PositionData, Pr
         entry_price_e6,
         is_long,
         global_funding_index_e18,
+        pnl_q,
+        fee_credits_q,
+        is_v12_17,
         engine_off: layout.engine_off,
         engine_mark_price_off: layout.engine_mark_price_off,
         engine_maint_margin_off: layout.engine_maint_margin_off,

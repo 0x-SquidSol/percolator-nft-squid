@@ -366,6 +366,10 @@ fn test_position_data_collateral_is_separate_from_size() {
         engine_mark_price_off: 0,
         engine_maint_margin_off: 0,
         engine_funding_index_off: 0,
+        // PERC-N2: v12.17 fields default to 0 / false for legacy fixtures.
+        pnl_q: 0,
+        fee_credits_q: 0,
+        is_v12_17: false,
     };
     // collateral ≠ size — using size as collateral would be 10× inflated
     assert_ne!(
@@ -1268,4 +1272,451 @@ fn test_slot_reused_error_code() {
         ProgramError::Custom(20),
         "SlotReused must be error code 20"
     );
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// PERC-N2: v12.17 valuation correctness — spec §3.4 `account_equity_maint_raw`
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Before the fix, `process_get_position_value` computed
+// `unrealized_pnl = if entry_price_e6 > 0 && mark > 0 { mark-vs-entry } else { 0 }`.
+// On v12.17 layouts the `Account.entry_price` field was removed, so
+// `read_position` always returns `entry_price_e6 = 0`, the `else` branch fires,
+// and `unrealized_pnl = 0`, `net_equity = collateral` — a deeply underwater
+// position appears break-even to any lending protocol or marketplace consuming
+// the `POSITION_VALUE:*` log stream.
+//
+// The fix routes v12.17 layouts through Percolator's authoritative equity
+// formula (spec §3.4, `RiskEngine::account_equity_maint_raw` in the upstream
+// `percolator` crate):
+//
+//     equity_maint_raw = capital + pnl - fee_debt
+//     fee_debt         = max(0, -fee_credits)
+//
+// `pnl` (Account+24) and `fee_credits` (Account+280) are persistent fields
+// on v12.17; `pnl` folds in funding accruals via the per-side mechanism so
+// the formula needs no funding-delta correction.
+//
+// These tests use `compute_position_value` directly (the pure-math function
+// extracted from `process_get_position_value`) so we can assert on every
+// field of `PositionValuation` without round-tripping through `msg!` logs.
+
+/// Build a minimal v12.17 slab with one allocated, open position.
+///
+/// Layout (matches `detect_layout` V12_17 branch in src/cpi.rs:384-438):
+///   * SLAB_MAGIC at [0..8] = `0x5045_5243_4F4C_4154` ("PERCOLAT")
+///   * RiskEngine at offset 584
+///   * RiskParams at engine+32 (= 616); `maintenance_margin_bps` at params+0
+///   * `max_accounts: u64` at engine+32+24 (= 640)
+///   * `last_oracle_price` at engine+624 (= 1208) — used as mark on v12.17
+///   * bitmap (RiskEngine.used) at engine+712 (= 1296)
+///   * after-bitmap tail: `num_used_accounts(u16) + free_head(u16) = 4` bytes,
+///     then `next_free: [u16; max_accounts]`, then 8-aligned accounts array
+///   * each Account is 408 bytes (slab_types::EXPECTED_ACCOUNT_SIZE)
+///   * v12.17 Account offsets used by the fixture:
+///       capital (U128 lo) at +0
+///       kind (u8)         at +16
+///       pnl (I128)        at +24
+///       position_basis_q  at +56
+///       owner ([u8;32])   at +192 (current slab_types::ACCT_OFF_OWNER)
+///       fee_credits (I128) at +280
+///   * trailing `RISK_BUF_LEN (160) + max_accounts * GEN_TABLE_ENTRY (8)` bytes
+///
+/// Inputs are all in slab-native units (no helper-side scaling). `pnl` and
+/// `fee_credits` are signed i128 so callers can express deep losses or fee
+/// debt directly. `position_basis_q` is two's-complement on v12.17.
+fn build_v12_17_slab(
+    owner: &solana_sdk::pubkey::Pubkey,
+    capital: u128,
+    pnl: i128,
+    fee_credits: i128,
+    position_basis_q: i128,
+    last_oracle_price_e6: u64,
+    maintenance_margin_bps: u64,
+) -> Vec<u8> {
+    const MAX_ACCOUNTS: u16 = 1;
+    const ENGINE_OFF: usize = 584;
+    const ACCOUNT_SIZE: usize = 408; // slab_types::EXPECTED_ACCOUNT_SIZE
+    const BITMAP_OFF: usize = ENGINE_OFF + 712; // 1296
+    const RISK_BUF_LEN: usize = 160;
+    const GEN_TABLE_ENTRY: usize = 8;
+    // Tail after bitmap: num_used_accounts(u16) + free_head(u16) = 4, then
+    // next_free: [u16; max_accounts], then 8-aligned accounts.
+    let bitmap_bytes: usize = (MAX_ACCOUNTS as usize).div_ceil(8); // 1
+    let after_bitmap = bitmap_bytes + 4 + (MAX_ACCOUNTS as usize) * 2;
+    let accounts_off_raw = BITMAP_OFF + after_bitmap;
+    let accounts_off = (accounts_off_raw + 7) & !7;
+    let trailing = RISK_BUF_LEN + (MAX_ACCOUNTS as usize) * GEN_TABLE_ENTRY;
+    let total = accounts_off + (MAX_ACCOUNTS as usize) * ACCOUNT_SIZE + trailing;
+    let mut data = vec![0u8; total];
+
+    // Magic
+    data[0..8].copy_from_slice(&0x5045_5243_4F4C_4154u64.to_le_bytes());
+    // Engine fields: max_accounts (u64) at engine+32+24 = 640.
+    data[ENGINE_OFF + 32 + 24..ENGINE_OFF + 32 + 24 + 8]
+        .copy_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
+    // maintenance_margin_bps at params+0 = engine+32.
+    data[ENGINE_OFF + 32..ENGINE_OFF + 32 + 8]
+        .copy_from_slice(&maintenance_margin_bps.to_le_bytes());
+
+    // Bitmap: slot 0 allocated.
+    data[BITMAP_OFF] = 0x01;
+
+    // Account[0] fields.
+    let a = accounts_off;
+    // capital: U128 lo at +0, hi at +8.
+    data[a..a + 8].copy_from_slice(&(capital as u64).to_le_bytes());
+    data[a + 8..a + 16].copy_from_slice(&((capital >> 64) as u64).to_le_bytes());
+    // kind = 0 (User) — already zeroed.
+    // pnl: I128 native two's complement at +24.
+    data[a + 24..a + 40].copy_from_slice(&pnl.to_le_bytes());
+    // position_basis_q: I128 native two's complement at +56.
+    data[a + 56..a + 72].copy_from_slice(&position_basis_q.to_le_bytes());
+    // owner: [u8; 32] at the layout-resolved offset (slab_types::ACCT_OFF_OWNER).
+    let owner_off = a + percolator_nft::slab_types::ACCT_OFF_OWNER;
+    data[owner_off..owner_off + 32].copy_from_slice(owner.as_ref());
+    // fee_credits: I128 at the layout-resolved offset.
+    let fc_off = a + percolator_nft::slab_types::ACCT_OFF_FEE_CREDITS;
+    data[fc_off..fc_off + 16].copy_from_slice(&fee_credits.to_le_bytes());
+
+    // last_oracle_price at engine + slab_types::ENGINE_REL_LAST_ORACLE_PRICE.
+    // The cpi.rs detect_layout's V12_17 branch resolves the mark-price
+    // offset from this constant (=1040 on the current vendored
+    // RiskEngine). With max_accounts=1 and detect_layout's hardcoded
+    // bitmap_off=engine+712, accounts_off lands at 1304 and Account[0]
+    // spans [1304..1712]. last_oracle_price at engine+1040 = 1624 falls
+    // inside Account[0]'s `sched_anchor_q` region (offset 320 within
+    // Account) — read_position never reads that field on v12.17, so
+    // overwriting it with the mark price is safe for this fixture.
+    // We write last_oracle_price LAST so it wins over any Account
+    // bytes that happen to overlap.
+    let mark_abs = ENGINE_OFF + percolator_nft::slab_types::ENGINE_REL_LAST_ORACLE_PRICE;
+    data[mark_abs..mark_abs + 8].copy_from_slice(&last_oracle_price_e6.to_le_bytes());
+
+    data
+}
+
+/// PERC-N2 helper: build a PositionNft PDA that satisfies the slot-reuse
+/// and PERC-9060 snapshot checks against a v12.17 slab built by
+/// `build_v12_17_slab(...)`. v12.17 has `entry_price_e6 == 0` in the PDA
+/// (snapshotted as 0 at mint time, since the slab field is gone).
+fn make_v12_17_pda(
+    slab_key: &solana_sdk::pubkey::Pubkey,
+    nft_mint_key: &solana_sdk::pubkey::Pubkey,
+    position_owner: [u8; 32],
+    is_long: u8,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; POSITION_NFT_LEN];
+    buf[..8].copy_from_slice(&POSITION_NFT_MAGIC.to_le_bytes());
+    buf[8] = POSITION_NFT_VERSION;
+    buf[16..48].copy_from_slice(slab_key.as_ref());
+    buf[56..88].copy_from_slice(nft_mint_key.as_ref());
+    // entry_price_e6 [88..96] = 0 (v12.17 has no Account.entry_price)
+    // position_size [96..104] = 0 (PDA snapshot, not checked by PERC-9060
+    // on v12.17 since entry_price_e6 / is_long match vacuously)
+    // is_long [104]
+    buf[104] = is_long;
+    // account_id [152..160] = 0
+    // position_owner [160..192]
+    buf[160..192].copy_from_slice(&position_owner);
+    buf
+}
+
+/// **PERC-N2 PROOF OF BUG**.
+///
+/// A position with deeply negative `account.pnl` (−900K out of 1M capital,
+/// i.e. only 100K of real equity left) is fed to `compute_position_value`.
+/// The CURRENT (pre-fix) code path uses `unrealized_pnl = 0` because
+/// `entry_price_e6 == 0` on v12.17, so it reports `net_equity = capital`
+/// (1M) instead of the spec-§3.4 value (100K) — a 10× over-statement of
+/// the position's worth. After the fix this test asserts the correct
+/// value, so the test serves both as bug evidence and fix regression.
+///
+/// Liquidation distance similarly flips from "fully healthy" to "nearly
+/// liquidatable" once the fix is applied.
+#[test]
+fn test_perc_n2_v12_17_valuation_uses_account_pnl_not_entry_diff() {
+    use percolator_nft::valuation::compute_position_value;
+    use solana_sdk::pubkey::Pubkey as SdkPubkey;
+
+    let slab_key = SdkPubkey::new_unique();
+    let nft_mint_key = SdkPubkey::new_unique();
+    let owner = SdkPubkey::new_unique();
+
+    let capital: u128 = 1_000_000;
+    let pnl: i128 = -900_000;
+    let fee_credits: i128 = 0;
+    let position_basis_q: i128 = 1_000_000_000; // POS_SCALE-scaled (1 unit)
+    let mark_price: u64 = 50_000_000; // E6
+    let mm_bps: u64 = 500; // 5%
+
+    let slab_data = build_v12_17_slab(
+        &owner,
+        capital,
+        pnl,
+        fee_credits,
+        position_basis_q,
+        mark_price,
+        mm_bps,
+    );
+
+    let pda_bytes = make_v12_17_pda(&slab_key, &nft_mint_key, owner.to_bytes(), 1);
+    let nft_state =
+        bytemuck::from_bytes::<PositionNft>(&pda_bytes[..POSITION_NFT_LEN]);
+
+    let v = compute_position_value(&slab_data, nft_state).expect("compute should succeed");
+
+    assert!(v.layout_v12_17, "fixture should be detected as v12.17");
+    assert_eq!(
+        v.unrealized_pnl, pnl,
+        "v12.17 unrealized_pnl must mirror account.pnl (not silently zero)"
+    );
+    assert_eq!(v.pnl_q, pnl, "raw pnl_q must equal account.pnl");
+    assert_eq!(v.fee_debt_q, 0, "no fee debt when fee_credits = 0");
+
+    // Spec §3.4: equity = capital + pnl - fee_debt.
+    // capital(1_000_000) + pnl(-900_000) - fee_debt(0) = 100_000.
+    let expected_equity: i128 = (capital as i128) + pnl;
+    assert_eq!(
+        v.net_equity, expected_equity,
+        "v12.17 net_equity must be spec-§3.4 equity_maint_raw, not silently `collateral`"
+    );
+
+    // Crucial: the BUG-BEFORE-FIX behaviour would have been:
+    //   unrealized_pnl = 0
+    //   net_equity     = collateral = 1_000_000
+    //   This test would have asserted 1_000_000, masking the 90% loss.
+    // The fact that we now assert 100_000 is what proves the fix.
+    assert_ne!(
+        v.net_equity, capital as i128,
+        "pre-fix would have reported net_equity == collateral; that is the bug"
+    );
+}
+
+/// PERC-N2: positive PnL is reported correctly (not capped or zeroed).
+#[test]
+fn test_perc_n2_v12_17_valuation_reports_positive_pnl() {
+    use percolator_nft::valuation::compute_position_value;
+    use solana_sdk::pubkey::Pubkey as SdkPubkey;
+
+    let slab_key = SdkPubkey::new_unique();
+    let nft_mint_key = SdkPubkey::new_unique();
+    let owner = SdkPubkey::new_unique();
+
+    let capital: u128 = 1_000_000;
+    let pnl: i128 = 500_000; // 50% gain
+    let slab_data = build_v12_17_slab(
+        &owner,
+        capital,
+        pnl,
+        0,
+        1_000_000_000,
+        50_000_000,
+        500,
+    );
+    let pda_bytes = make_v12_17_pda(&slab_key, &nft_mint_key, owner.to_bytes(), 1);
+    let nft_state =
+        bytemuck::from_bytes::<PositionNft>(&pda_bytes[..POSITION_NFT_LEN]);
+    let v = compute_position_value(&slab_data, nft_state).unwrap();
+
+    assert!(v.layout_v12_17);
+    assert_eq!(v.unrealized_pnl, pnl);
+    assert_eq!(v.net_equity, (capital as i128) + pnl);
+}
+
+/// PERC-N2: fee_debt is subtracted from equity (matches `fee_debt_u128_checked`
+/// upstream semantics — negative fee_credits = positive fee_debt).
+#[test]
+fn test_perc_n2_v12_17_valuation_subtracts_fee_debt() {
+    use percolator_nft::valuation::compute_position_value;
+    use solana_sdk::pubkey::Pubkey as SdkPubkey;
+
+    let slab_key = SdkPubkey::new_unique();
+    let nft_mint_key = SdkPubkey::new_unique();
+    let owner = SdkPubkey::new_unique();
+
+    let capital: u128 = 1_000_000;
+    let pnl: i128 = 0;
+    let fee_credits: i128 = -50_000; // 50K fee debt
+    let slab_data = build_v12_17_slab(
+        &owner,
+        capital,
+        pnl,
+        fee_credits,
+        1_000_000_000,
+        50_000_000,
+        500,
+    );
+    let pda_bytes = make_v12_17_pda(&slab_key, &nft_mint_key, owner.to_bytes(), 1);
+    let nft_state =
+        bytemuck::from_bytes::<PositionNft>(&pda_bytes[..POSITION_NFT_LEN]);
+    let v = compute_position_value(&slab_data, nft_state).unwrap();
+
+    assert!(v.layout_v12_17);
+    assert_eq!(v.pnl_q, 0);
+    assert_eq!(v.fee_debt_q, 50_000, "negative fee_credits maps to positive fee_debt");
+    // equity = 1_000_000 + 0 - 50_000 = 950_000
+    assert_eq!(v.net_equity, 950_000);
+}
+
+/// PERC-N2: positive `fee_credits` (pre-paid fees) yields `fee_debt = 0`, not
+/// negative debt. Upstream `fee_debt_u128_checked` clamps at 0.
+#[test]
+fn test_perc_n2_v12_17_valuation_positive_fee_credits_zero_debt() {
+    use percolator_nft::valuation::compute_position_value;
+    use solana_sdk::pubkey::Pubkey as SdkPubkey;
+
+    let slab_key = SdkPubkey::new_unique();
+    let nft_mint_key = SdkPubkey::new_unique();
+    let owner = SdkPubkey::new_unique();
+
+    let slab_data = build_v12_17_slab(
+        &owner,
+        1_000_000,
+        0,
+        25_000, // positive credit
+        1_000_000_000,
+        50_000_000,
+        500,
+    );
+    let pda_bytes = make_v12_17_pda(&slab_key, &nft_mint_key, owner.to_bytes(), 1);
+    let nft_state =
+        bytemuck::from_bytes::<PositionNft>(&pda_bytes[..POSITION_NFT_LEN]);
+    let v = compute_position_value(&slab_data, nft_state).unwrap();
+
+    assert_eq!(v.fee_debt_q, 0, "positive fee_credits must clamp fee_debt to 0");
+    assert_eq!(v.net_equity, 1_000_000, "no debt subtracted when fee_credits > 0");
+}
+
+/// PERC-N2: maintenance_margin on v12.17 uses notional in quote micro-units,
+/// not the raw POS_SCALE-scaled basis-quote size. This catches the
+/// pre-fix off-by-(`mark_price_e6 / POS_SCALE`)-factor in the legacy formula
+/// applied to v12.17 sizes.
+#[test]
+fn test_perc_n2_v12_17_maintenance_margin_uses_quote_notional() {
+    use percolator_nft::valuation::compute_position_value;
+    use solana_sdk::pubkey::Pubkey as SdkPubkey;
+
+    let slab_key = SdkPubkey::new_unique();
+    let nft_mint_key = SdkPubkey::new_unique();
+    let owner = SdkPubkey::new_unique();
+
+    // position_basis_q = 1_000_000_000 (basis-quote units, POS_SCALE=1_000_000).
+    // mark_price_e6 = 50_000_000 (= price 50.0 in E6).
+    // notional = |basis_q| * mark / POS_SCALE
+    //          = 1_000_000_000 * 50_000_000 / 1_000_000
+    //          = 5e16 / 1e6 = 5e10 = 50_000_000_000.
+    // mm_req = notional * bps / 10_000 = 50_000_000_000 * 500 / 10_000
+    //        = 2_500_000_000.
+    let position_basis_q: i128 = 1_000_000_000;
+    let mark_price: u64 = 50_000_000;
+    let mm_bps: u64 = 500;
+
+    let slab_data = build_v12_17_slab(
+        &owner,
+        1_000_000,
+        0,
+        0,
+        position_basis_q,
+        mark_price,
+        mm_bps,
+    );
+    let pda_bytes = make_v12_17_pda(&slab_key, &nft_mint_key, owner.to_bytes(), 1);
+    let nft_state =
+        bytemuck::from_bytes::<PositionNft>(&pda_bytes[..POSITION_NFT_LEN]);
+    let v = compute_position_value(&slab_data, nft_state).unwrap();
+
+    let expected_mm: u128 = 2_500_000_000;
+    assert_eq!(
+        v.maintenance_margin, expected_mm,
+        "v12.17 mm_req must use notional in quote micro-units, not raw basis-quote size"
+    );
+}
+
+/// PERC-N2 regression: legacy (V0) layout still uses the mark-vs-entry PnL
+/// formula and produces non-zero `unrealized_pnl` and `net_equity`.
+/// Pinning this prevents the fix from accidentally re-routing legacy
+/// positions through the v12.17 spec-§3.4 path.
+#[test]
+fn test_perc_n2_legacy_v0_valuation_unchanged() {
+    use percolator_nft::valuation::compute_position_value;
+    use solana_sdk::pubkey::Pubkey as SdkPubkey;
+
+    let slab_key = SdkPubkey::new_unique();
+    let nft_mint_key = SdkPubkey::new_unique();
+    let owner = SdkPubkey::new_unique();
+
+    let entry_price: u64 = 50_000_000;
+    let mark_price: u64 = 60_000_000; // +20% move
+    let size: u64 = 1_000_000;
+    let collateral: u64 = 100_000;
+    let mm_bps: u64 = 500;
+
+    // Reuse the legacy V0 open-position helper from the PERC-N1 fix
+    // submission.  (Inlined here for clarity in case the helper is renamed.)
+    let max_accounts: u16 = 1;
+    let v0_bitmap_off: usize = 608;
+    let v0_account_size: usize = 240;
+    let total = v0_bitmap_off + 1 + max_accounts as usize * v0_account_size;
+    let mut slab_data = vec![0u8; total];
+    slab_data[0..8].copy_from_slice(&0x5045_5243_4F4C_4154u64.to_le_bytes());
+    slab_data[8..10].copy_from_slice(&max_accounts.to_le_bytes());
+    slab_data[v0_bitmap_off] = 0x01;
+    let accounts_off = v0_bitmap_off + 1;
+    // V0 Account offsets: capital lo at +8; position_size lo at +80; hi at +88
+    // (sign+magnitude, hi=0 ⇒ long); entry_price at +96; owner at +184.
+    slab_data[accounts_off + 8..accounts_off + 16]
+        .copy_from_slice(&(collateral as u64).to_le_bytes());
+    slab_data[accounts_off + 80..accounts_off + 88].copy_from_slice(&size.to_le_bytes());
+    // hi-word stays 0 ⇒ long
+    slab_data[accounts_off + 96..accounts_off + 104].copy_from_slice(&entry_price.to_le_bytes());
+    let owner_off = accounts_off + 184;
+    slab_data[owner_off..owner_off + 32].copy_from_slice(owner.as_ref());
+    // V0 engine offsets: engine at 480, mark at engine+0, maint at engine+96
+    let engine_off: usize = 480;
+    slab_data[engine_off..engine_off + 8].copy_from_slice(&mark_price.to_le_bytes());
+    slab_data[engine_off + 96..engine_off + 96 + 8].copy_from_slice(&mm_bps.to_le_bytes());
+
+    // PDA snapshot must match entry/is_long for the PERC-9060 check.
+    let mut pda_bytes = vec![0u8; POSITION_NFT_LEN];
+    pda_bytes[..8].copy_from_slice(&POSITION_NFT_MAGIC.to_le_bytes());
+    pda_bytes[8] = POSITION_NFT_VERSION;
+    pda_bytes[16..48].copy_from_slice(slab_key.as_ref());
+    pda_bytes[56..88].copy_from_slice(nft_mint_key.as_ref());
+    pda_bytes[88..96].copy_from_slice(&entry_price.to_le_bytes());
+    pda_bytes[96..104].copy_from_slice(&size.to_le_bytes());
+    pda_bytes[104] = 1;
+    pda_bytes[160..192].copy_from_slice(&owner.to_bytes());
+    let nft_state = bytemuck::from_bytes::<PositionNft>(&pda_bytes[..POSITION_NFT_LEN]);
+
+    let v = compute_position_value(&slab_data, nft_state).expect("legacy compute succeeds");
+
+    assert!(!v.layout_v12_17, "V0 layout must not be flagged as v12.17");
+    // size * (mark - entry) / entry = 1_000_000 * 10_000_000 / 50_000_000 = 200_000
+    assert_eq!(v.unrealized_pnl, 200_000);
+    assert_eq!(v.net_equity, (collateral as i128) + 200_000);
+    assert_eq!(v.pnl_q, 0, "pnl_q is v12.17-only");
+    assert_eq!(v.fee_debt_q, 0, "fee_debt_q is v12.17-only");
+}
+
+/// PERC-N2: `is_v12_17` flag on `PositionData` must match the layout
+/// detection in `cpi::detect_layout`. Pins the contract between
+/// `read_position` and `compute_position_value`.
+#[test]
+fn test_perc_n2_position_data_is_v12_17_flag_consistent() {
+    use percolator_nft::cpi::read_position;
+    use solana_sdk::pubkey::Pubkey as SdkPubkey;
+
+    let owner = SdkPubkey::new_unique();
+
+    // v12.17 slab ⇒ flag must be true.
+    let v12 = build_v12_17_slab(&owner, 1_000_000, 0, 0, 1_000_000_000, 50_000_000, 500);
+    let p = read_position(&v12, 0).expect("read v12.17 position");
+    assert!(p.is_v12_17, "v12.17 fixture must set is_v12_17 = true");
+    assert_eq!(p.entry_price_e6, 0);
+
+    // V0 slab (closed position fixture) ⇒ flag must be false.
+    let v0 = build_v0_slab_with_owner(&owner);
+    let p0 = read_position(&v0, 0).expect("read V0 position");
+    assert!(!p0.is_v12_17, "V0 fixture must set is_v12_17 = false");
 }
