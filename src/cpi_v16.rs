@@ -30,6 +30,33 @@
 
 use solana_program::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey};
 
+// ═══════════════════════════════════════════════════════════════
+// NFT registry PDA (SHARED SEED CONTRACT with percolator-prog)
+// ═══════════════════════════════════════════════════════════════
+
+/// Per-market NFT registry PDA seed. SHARED CONTRACT with percolator-prog
+/// `constants::NFT_REGISTRY_SEED` / `state::derive_nft_registry`. The wrapper's
+/// B-3 re-derives the SAME per-market registry PDA and validates the passed
+/// account against it. The registry PDA is owned by the WRAPPER program (the
+/// program that owns the portfolio account), so it is derived under
+/// `wrapper_program_id` (= `portfolio.owner`), NOT the NFT program id.
+pub const NFT_REGISTRY_SEED: &[u8] = b"nft_registry";
+
+/// Derive the per-market NFT registry PDA. The PDA is owned by
+/// `wrapper_program_id` (the Percolator wrapper that owns portfolio accounts)
+/// and is keyed by `market_group` so each market group has its own registry.
+///
+/// SHARED CONTRACT: the wrapper's B-3 `TransferPortfolioOwnership` handler
+/// derives the same PDA from the same seeds under the same program and validates
+/// the account passed to it. Any drift between this derivation and the wrapper's
+/// breaks the CPI.
+pub fn derive_nft_registry(wrapper_program_id: &Pubkey, market_group: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[NFT_REGISTRY_SEED, market_group.as_ref()],
+        wrapper_program_id,
+    )
+}
+
 use crate::error::NftError;
 use crate::slab_types_v16::{
     LegTransferGate, PortfolioAccountV16Account, PortfolioDecodeError, WRAPPER_MAX_PORTFOLIO_ASSETS,
@@ -166,6 +193,30 @@ mod tests {
     use crate::slab_types_v16::{V16PodI128, V16PodU32, V16PodU64};
     use crate::state_v16::{PositionNftV16, POSITION_NFT_V16_MAGIC, POSITION_NFT_V16_VERSION};
     use bytemuck::Zeroable;
+
+    // ── derive_nft_registry unit tests ──────────────────────────────────
+
+    #[test]
+    fn nft_registry_pda_is_per_market() {
+        let wrapper = Pubkey::new_unique();
+        let group_a = Pubkey::new_unique();
+        let group_b = Pubkey::new_unique();
+        let (pda_a, _) = derive_nft_registry(&wrapper, &group_a);
+        let (pda_b, _) = derive_nft_registry(&wrapper, &group_b);
+        // Two different market groups under the same wrapper yield different PDAs
+        // (per-market correctness — each market group has its own registry).
+        assert_ne!(pda_a, pda_b, "distinct market_groups must produce distinct registry PDAs");
+    }
+
+    #[test]
+    fn nft_registry_pda_is_deterministic() {
+        let wrapper = Pubkey::new_unique();
+        let group = Pubkey::new_unique();
+        let (pda1, bump1) = derive_nft_registry(&wrapper, &group);
+        let (pda2, bump2) = derive_nft_registry(&wrapper, &group);
+        assert_eq!(pda1, pda2, "same inputs must yield the same registry PDA");
+        assert_eq!(bump1, bump2, "same inputs must yield the same bump");
+    }
 
     fn portfolio_with_leg(owner: [u8; 32], asset_index: u32, market_id: u64, basis: i128)
         -> PortfolioAccountV16Account

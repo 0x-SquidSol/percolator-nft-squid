@@ -123,6 +123,7 @@ fn process_mint_position_nft(
     let snap_market_id = leg.market_id.get();
     let snap_epoch_snap = leg.epoch_snap.get();
     let snap_owner = p.owner();
+    let market_group = Pubkey::new_from_array(p.provenance_header.market_group_id);
     // The percolator program id is the wrapper that OWNS the portfolio account.
     let percolator_prog_id: Pubkey = *portfolio.owner;
     drop(portfolio_data);
@@ -308,13 +309,14 @@ fn process_mint_position_nft(
     // ════════════════════════════════════════════════════════════════════
     // Atomic ExtraAccountMetaList PDA initialization
     //
-    // TLV layout (6 entries):
-    //   [5] PositionNft PDA      — writable  (hook updates f_snap_at_mint)
-    //   [6] Portfolio account    — WRITABLE  (future B-3 CPI mutates it)
-    //   [7] Percolator program   — read-only (from portfolio.owner, allowlist-verified)
-    //   [8] Mint authority PDA   — read-only
-    //   [9] Instructions sysvar  — read-only
-    //  [10] NFT program (self)   — read-only
+    // TLV layout (7 entries):
+    //   [5] PositionNft PDA        — writable  (hook updates f_snap_at_mint)
+    //   [6] Portfolio account      — WRITABLE  (B-3 CPI mutates portfolio.owner)
+    //   [7] Percolator program     — read-only (from portfolio.owner, allowlist-verified)
+    //   [8] Mint authority PDA     — read-only
+    //   [9] Instructions sysvar    — read-only
+    //  [10] NFT program (self)     — read-only
+    //  [11] NFT registry PDA       — read-only (per-market; derived under wrapper_program_id)
     // ════════════════════════════════════════════════════════════════════
     {
         // Re-assert portfolio ownership so this block's security guarantee is
@@ -327,6 +329,10 @@ fn process_mint_position_nft(
             percolator_prog_id == cpi_v16::PERCOLATOR_DEVNET
                 || percolator_prog_id == cpi_v16::PERCOLATOR_MAINNET
         );
+
+        // Derive the per-market NFT registry PDA under the wrapper program id.
+        // The wrapper's B-3 re-derives the same PDA and validates the account.
+        let (registry_pda, _) = cpi_v16::derive_nft_registry(&percolator_prog_id, &market_group);
 
         let (expected_extra_metas, extra_metas_bump) =
             extra_account_metas_pda(nft_mint.key, program_id);
@@ -341,7 +347,7 @@ fn process_mint_position_nft(
         }
 
         const EXTRA_META_ENTRY_LEN: usize = 35;
-        const EXTRA_META_COUNT: usize = 6;
+        const EXTRA_META_COUNT: usize = 7;
         const EXTRA_METAS_ACCOUNT_LEN: usize =
             8 /* TLV type */ + 4 /* TLV length */ + 4 /* entry count */
             + EXTRA_META_ENTRY_LEN * EXTRA_META_COUNT;
@@ -390,7 +396,7 @@ fn process_mint_position_nft(
         let entries: [(Pubkey, bool, bool); EXTRA_META_COUNT] = [
             // 5: PositionNft PDA — writable (hook updates f_snap_at_mint on transfer)
             (*nft_pda.key, false, true),
-            // 6: Portfolio account — WRITABLE (B-3 CPI will mutate portfolio.owner)
+            // 6: Portfolio account — WRITABLE (B-3 CPI mutates portfolio.owner)
             (*portfolio.key, false, true),
             // 7: Percolator program — read-only, from verified portfolio.owner
             (percolator_prog_id, false, false),
@@ -400,6 +406,8 @@ fn process_mint_position_nft(
             (sysvar_instructions::id(), false, false),
             // 10: NFT program (self) — read-only
             (*program_id, false, false),
+            // 11: Per-market NFT registry PDA — read-only, derived under wrapper_program_id
+            (registry_pda, false, false),
         ];
 
         for (i, (key, is_signer, is_writable)) in entries.iter().enumerate() {
@@ -916,6 +924,17 @@ fn process_repair_extra_metas(
     cpi_v16::verify_portfolio_program(portfolio)?;
     let percolator_prog_id = *portfolio.owner;
 
+    // Decode portfolio to read market_group_id for the registry PDA derivation.
+    let market_group: Pubkey = {
+        let portfolio_data = portfolio.try_borrow_data()?;
+        let p = slab_types_v16::decode_portfolio(&portfolio_data)
+            .map_err(cpi_v16::map_decode_err)?;
+        Pubkey::new_from_array(p.provenance_header.market_group_id)
+    };
+
+    // Derive the per-market NFT registry PDA under the wrapper program id.
+    let (registry_pda, _) = cpi_v16::derive_nft_registry(&percolator_prog_id, &market_group);
+
     // mint_auth is validated as a canonical PDA of this program.
     let (expected_mint_auth, _) = mint_authority_pda(program_id);
     if *mint_auth.key != expected_mint_auth {
@@ -924,7 +943,7 @@ fn process_repair_extra_metas(
     }
 
     const EXTRA_META_ENTRY_LEN: usize = 35;
-    const EXTRA_META_COUNT: usize = 6;
+    const EXTRA_META_COUNT: usize = 7;
     const HEADER_LEN: usize = 16;
     const EXTRA_METAS_ACCOUNT_LEN: usize =
         HEADER_LEN + EXTRA_META_ENTRY_LEN * EXTRA_META_COUNT;
@@ -952,12 +971,13 @@ fn process_repair_extra_metas(
     data[12..16].copy_from_slice(&(EXTRA_META_COUNT as u32).to_le_bytes());
 
     let entries: [(Pubkey, bool, bool); EXTRA_META_COUNT] = [
-        (*nft_pda.key, false, true),       // 5: PositionNft PDA — writable
-        (*portfolio.key, false, true),     // 6: Portfolio account — WRITABLE (B-3 CPI)
-        (percolator_prog_id, false, false), // 7: Percolator program — read-only
-        (*mint_auth.key, false, false),    // 8: Mint authority PDA — read-only
-        (sysvar_instructions::id(), false, false), // 9: Instructions sysvar — read-only
-        (*program_id, false, false),       // 10: NFT program (self) — read-only
+        (*nft_pda.key, false, true),                     // 5: PositionNft PDA — writable
+        (*portfolio.key, false, true),                   // 6: Portfolio account — WRITABLE (B-3 CPI)
+        (percolator_prog_id, false, false),              // 7: Percolator program — read-only
+        (*mint_auth.key, false, false),                  // 8: Mint authority PDA — read-only
+        (sysvar_instructions::id(), false, false),       // 9: Instructions sysvar — read-only
+        (*program_id, false, false),                     // 10: NFT program (self) — read-only
+        (registry_pda, false, false),                    // 11: Per-market NFT registry PDA — read-only
     ];
     for (i, (key, is_signer, is_writable)) in entries.iter().enumerate() {
         let off = HEADER_LEN + i * EXTRA_META_ENTRY_LEN;
