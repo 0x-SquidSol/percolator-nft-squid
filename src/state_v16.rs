@@ -97,17 +97,20 @@ impl PositionNftV16 {
 }
 
 /// Derive the PositionNft PDA for a `(portfolio_account, market_id)` pair
-/// (design §4.1 Option B — per-position NFT). `market_id` is the v16 position
-/// **instance** id (`legs[].market_id`), encoded as u64 LE.
+/// (design §4.1 Option B — per-position NFT). `market_id` is the v16 leg's
+/// `legs[].market_id` (a per-asset-slot incarnation id — see the `cpi_v16`
+/// module docs), encoded as u64 LE.
 ///
-/// #108: the seed is keyed on `market_id`, NOT `asset_index`. The engine
-/// **reuses** `asset_index` when a portfolio closes a position and opens a new
-/// one on the same asset, so an `asset_index`-keyed PDA would let a stale NFT
-/// squat the slot and permanently block (`NftAlreadyMinted`) wrapping the new
-/// position — a third-party liveness DoS, since only the stale NFT's holder can
-/// `EmergencyBurn` it. `market_id` is strictly monotonic and never reused
-/// (mirrors `market_id_at_mint`, the slot-reuse anchor), so every distinct
-/// position instance derives a distinct PDA and the alias/lock cannot occur.
+/// #108: the seed is keyed on `market_id`, NOT `asset_index`, because
+/// `market_id` is the correct slot-reuse anchor (invariant across transfers/
+/// trades, changes on asset-slot reactivation). NOTE: `market_id` is per-asset-
+/// slot, NOT per-position-instance — a user who closes and reopens on the same
+/// still-active asset reuses the SAME `market_id` — so keying on it does not by
+/// itself prevent the #108 stale-NFT squat lock. That lock is prevented by the
+/// #105 ESCROW model: mint escrows the portfolio to the mint-authority PDA, so
+/// (a) only one NFT can exist per portfolio (a 2nd mint fails `mint_leg_slot`'s
+/// `owner == caller` check), and (b) burning frees this PDA before a new
+/// position can be opened — so a stale NFT can never block a re-wrap.
 ///
 /// At mint the caller has the active leg, so it derives with `leg.market_id`.
 /// On every later op (transfer/burn/settle/valuation) the handler reads the
