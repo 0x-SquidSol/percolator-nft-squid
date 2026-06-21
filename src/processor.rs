@@ -963,14 +963,30 @@ fn process_emergency_burn(program_id: &Pubkey, accounts: &[AccountInfo]) -> Prog
         return Err(NftError::InvalidNftPda.into());
     }
 
+    // ── #131: tolerate a bound portfolio the core has already closed ──────────
+    // Under #105 escrow the core can permissionlessly close an EMPTY escrowed
+    // portfolio (deregister + close_portfolio_account_to_market_slab: zero data +
+    // realloc(0) + sweep lamports → the account becomes 0-byte / system-owned).
+    // The NFT is uniquely pinned to this portfolio by the nft_state.portfolio_account
+    // binding above (which holds on any account state), so a gone account means the
+    // bound position is unrecoverably closed AND the escrow was already released by
+    // that closure. Detect it NARROWLY — not-wrapper-owned OR 0-byte, exactly the
+    // closure footprint; a LIVE escrowed portfolio is wrapper-owned + non-empty so
+    // this is false and the normal eligibility check + unwrap run unchanged. When
+    // gone, skip both so the holder can still reclaim the NFT-side rent. The core
+    // only closes value-empty portfolios, so this never abandons recoverable funds.
+    let portfolio_gone =
+        cpi_v16::verify_portfolio_program(portfolio).is_err() || portfolio.data_is_empty();
+
     // ── Check emergency burn eligibility (position flat / no active leg) ──
-    cpi_v16::verify_portfolio_program(portfolio)?;
-    {
+    if !portfolio_gone {
         let portfolio_data = portfolio.try_borrow_data()?;
         let p = slab_types_v16::decode_portfolio(&portfolio_data)
             .map_err(cpi_v16::map_decode_err)?;
         cpi_v16::emergency_burn_ok(p, &nft_state_copy)
             .map_err(ProgramError::from)?;
+    } else {
+        msg!("EmergencyBurn: bound portfolio closed/reclaimed — skipping eligibility + unwrap (#131)");
     }
 
     // ── Verify holder owns the NFT via the canonical Token-2022 ATA ──
@@ -993,15 +1009,20 @@ fn process_emergency_burn(program_id: &Pubkey, accounts: &[AccountInfo]) -> Prog
     // to the burning holder. UnwrapEscrowedPortfolio is deliberately not gated on
     // leg/resolved state, so residual collateral / resolved payouts remain
     // recoverable by the holder via their own owner-gated calls afterwards.
-    verify_percolator_prog_account(percolator_prog, portfolio)?;
-    cpi_unwrap_portfolio(
-        percolator_prog,
-        mint_auth,
-        portfolio,
-        nft_registry,
-        holder.key,
-        mint_auth_bump,
-    )?;
+    //
+    // #131: if the core already closed the bound portfolio there is no account to
+    // unwrap (escrow released by the closure) — skip the CPI and proceed to burn.
+    if !portfolio_gone {
+        verify_percolator_prog_account(percolator_prog, portfolio)?;
+        cpi_unwrap_portfolio(
+            percolator_prog,
+            mint_auth,
+            portfolio,
+            nft_registry,
+            holder.key,
+            mint_auth_bump,
+        )?;
+    }
 
     invoke(
         &token2022::close_account(holder_ata.key, holder.key, holder.key),
