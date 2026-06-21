@@ -357,8 +357,11 @@ fn process_mint_position_nft(
         return Err(NftError::InvalidNftPda.into());
     }
 
-    // ── Check not already minted ──
-    if !nft_pda.data_is_empty() {
+    // ── Check not already minted (#129) ──
+    // "Already minted" means THIS program owns the PDA AND it carries state. A
+    // dusted PDA (System-owned, lamports, empty data) must NOT trip this — the
+    // grief-resistant create below claims it. Mirrors the extra_metas guard.
+    if nft_pda.owner == program_id && !nft_pda.data_is_empty() {
         return Err(NftError::NftAlreadyMinted.into());
     }
 
@@ -387,7 +390,16 @@ fn process_mint_position_nft(
         return Err(NftError::InvalidNftPda.into());
     }
 
-    // ── Create PositionNft PDA account ──
+    // ── Create PositionNft PDA account (#129: dust-griefing-resistant) ──
+    // A bare system create_account aborts with AccountAlreadyInUse if the target
+    // already holds ANY lamports, and nft_pda's seeds (["position_nft", portfolio,
+    // market_id]) are public — so anyone could send it 1 lamport and permanently
+    // brick MintPositionNft for this position. Instead, mirror the extra_metas PDA
+    // below: top up only the rent shortfall, then allocate + assign under the PDA's
+    // own seeds. Only THIS program can sign for those seeds, so a third party can
+    // at most DUST the System-owned address (absorbed, and returned to the holder
+    // at burn); it cannot pre-allocate or pre-assign it. The end state is
+    // byte-identical to create_account for an un-dusted PDA.
     let rent = Rent::get()?;
     let lamports = rent.minimum_balance(POSITION_NFT_V16_LEN);
     let market_id_le = snap_market_id.to_le_bytes();
@@ -398,15 +410,22 @@ fn process_mint_position_nft(
         &[bump],
     ];
 
+    let current_lamports = nft_pda.lamports();
+    if current_lamports < lamports {
+        let shortfall = lamports - current_lamports;
+        invoke(
+            &system_instruction::transfer(owner.key, nft_pda.key, shortfall),
+            &[owner.clone(), nft_pda.clone(), system_program.clone()],
+        )?;
+    }
     invoke_signed(
-        &system_instruction::create_account(
-            owner.key,
-            nft_pda.key,
-            lamports,
-            POSITION_NFT_V16_LEN as u64,
-            program_id,
-        ),
-        &[owner.clone(), nft_pda.clone(), system_program.clone()],
+        &system_instruction::allocate(nft_pda.key, POSITION_NFT_V16_LEN as u64),
+        &[nft_pda.clone(), system_program.clone()],
+        &[pda_seeds],
+    )?;
+    invoke_signed(
+        &system_instruction::assign(nft_pda.key, program_id),
+        &[nft_pda.clone(), system_program.clone()],
         &[pda_seeds],
     )?;
 
