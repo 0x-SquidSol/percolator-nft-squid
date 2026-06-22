@@ -13,18 +13,35 @@
 //! plumbing + the (unchanged) Token-2022 CPIs around these functions; the
 //! end-to-end path is verified by the A.5 LiteSVM suite.
 //!
-//! ## v16 position identity = `market_id` (slot-reuse anchor)
+//! ## v16 slot-reuse anchor = `market_id` (per-asset-slot incarnation id)
 //!
-//! v16 `market_id` is strictly monotonic and never reused (engine
-//! `next_market_id` only ever `checked_add(1)`). It uniquely identifies a
-//! position INSTANCE and is invariant across the NFT's life — it does NOT
-//! change on a legitimate ownership transfer or as the position is traded.
-//! It is therefore the ONLY correct slot-reuse anchor:
+//! v16 `market_id` is assigned per asset market-slot ACTIVATION: the engine's
+//! `next_market_id` is incremented (`checked_add(1)`) only in
+//! `activate_empty_market_slot_not_atomic`, and a position/leg open copies the
+//! asset's current id (`leg.market_id = asset.market_id`). So `market_id`
+//! identifies an asset-slot INCARNATION, NOT a per-user-position instance: a
+//! user who closes and reopens on the same still-active asset gets the SAME
+//! `market_id`. It changes only when the asset slot is retired and reactivated.
+//!
+//! That is exactly the property a slot-reuse anchor needs, and it is the ONLY
+//! correct one:
+//!   * invariant across a legit B-3 ownership transfer AND as the position is
+//!     traded (so it does NOT false-positive on transfer/trade), yet
+//!   * changes when the asset slot is reused by a newer incarnation, so
+//!     `verify_bound_leg`/`emergency_burn_ok` detect a reused slot
+//!     (`MarketIdMismatch`).
 //!   * `provenance.owner` changes on a legit B-3 transfer → useless as a reuse
 //!     gate (would false-positive on every transferred NFT).
 //!   * `leg.epoch_snap` advances with funding → useless as a reuse gate
 //!     (would false-positive on normal funding accrual).
 //!   * `leg.basis_pos_q` changes as the position is traded → not an identity.
+//!
+//! NOTE: because `market_id` is reused across a close/reopen on the same asset,
+//! keying the PositionNft PDA on it does NOT by itself prevent the #108 stale-NFT
+//! squat lock. That lock is prevented by the #105 ESCROW model: mint escrows the
+//! portfolio to the mint-authority PDA, so only one NFT can exist per portfolio
+//! and burning frees the PDA before a new position can be opened. See
+//! `state_v16::position_nft_pda`.
 //!
 //! So the reuse check is `market_id`-only (design-correction (b), §16.2). The
 //! mint-time `epoch_snap`/`position_owner` snapshots are kept informational.

@@ -308,6 +308,15 @@ fn process_mint_position_nft(
     let slot = cpi_v16::mint_leg_slot(p, &owner.key.to_bytes(), asset_index as u32)
         .map_err(ProgramError::from)?;
 
+    // Fail-fast (#127): the escrow CPI at the END of mint runs the wrapper's B-3
+    // gate, which rejects a locked / stale / resolved / mid-close position. Mirror
+    // that gate here — `transfer_gate_check` maps the same `leg_transfer_gate` the
+    // wrapper's B-3 enforces — so mint reverts with a precise error BEFORE any
+    // irreversible Token-2022 work (mint/ATA/metadata/extra-metas) instead of
+    // after it. This rejects exactly the set B-3 would reject (no legitimate mint
+    // is blocked); the escrow CPI remains the authoritative final check.
+    cpi_v16::transfer_gate_check(p, asset_index as u32).map_err(ProgramError::from)?;
+
     let leg = &p.legs[slot];
     // Snapshot all leg fields needed before dropping the borrow.
     let snap_side = leg.side;
