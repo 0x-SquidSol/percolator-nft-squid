@@ -1,45 +1,59 @@
 # percolator-nft
 
-Position NFT wrapper for Percolator — mint transferable Token-2022 NFTs representing open perpetual futures positions.
+Position NFT wrapper for Percolator — mint transferable Token-2022 NFTs representing open perpetual futures positions, with **true escrow custody** of the underlying position while wrapped.
 
 ## Architecture
 
 ```
 percolator-nft (this program)
-  ├── Reads position state from Percolator slab accounts (CPI-free, direct data read)
-  ├── SPL Token-2022 (mint/burn position NFTs, decimals=0, supply=1)
-  ├── PositionNft PDA (links NFT mint → slab + user_idx)
-  └── SettleFunding (permissionless crank to sync funding index before transfer)
+  ├── Reads portfolio state directly from Percolator portfolio accounts (no CPI for reads)
+  ├── SPL Token-2022 (mint/burn position NFTs, decimals=0, supply=1, TransferHook)
+  ├── PositionNft PDA (links NFT mint → portfolio + market_id)
+  └── CPIs the Percolator core ONLY for custody:
+        • Mint  → B-3 TransferPortfolioOwnership (tag 72): escrow portfolio.owner → mint-authority PDA
+        • Burn  → UnwrapEscrowedPortfolio       (tag 82): release portfolio.owner → burning holder
 ```
 
 **Why a wrapper?**
-- Core program stays lean — no Token-2022 dependency in the BPF binary
+- Core program stays lean — no Token-2022 dependency in the core BPF binary
 - Independent upgradability — iterate on NFT logic without touching core
 - Security isolation — NFT bugs can't affect core funds
 - Same pattern as `percolator-stake`
 
+## Custody model (escrow-at-mint, "frozen while wrapped")
+
+- **Mint** takes true custody: it CPIs the core's B-3 `TransferPortfolioOwnership` (tag 72) to set `portfolio.owner` = this program's mint-authority PDA. While wrapped, the original owner can no longer operate the position (trade / reduce / close / withdraw). This closes the OTC pre-transfer drain window.
+- **Transfer** moves only the bearer token; the position stays escrowed (the hook reassigns no ownership — it only *gates* the transfer).
+- **Burn / EmergencyBurn** release custody: they CPI the core's `UnwrapEscrowedPortfolio` (tag 82) to return `portfolio.owner` to the burning holder. Because the portfolio is owned by a program PDA while wrapped, only one NFT can exist per portfolio at a time.
+
 ## Instructions
 
-| Tag | Name | Description |
-|-----|------|-------------|
-| 0 | `MintPositionNft` | Mint an NFT for an open position (caller must own the position) |
-| 1 | `BurnPositionNft` | Burn the NFT, release position back to direct ownership |
-| 2 | `SettleFunding` | Permissionless crank — update funding index before transfer |
-| 3 | `EmergencyBurn` | Admin-only emergency burn of a position NFT |
-| 4 | `GetPositionValue` | Read-only CPI: returns current position value at oracle price |
+| Tag | Name | Caller | Description |
+|-----|------|--------|-------------|
+| 0 | `MintPositionNft` | position owner | Mint an NFT for an open leg; escrows the portfolio (12 accounts) |
+| 1 | `BurnPositionNft` | NFT holder | Burn the NFT, release escrow to the holder (10 accounts) |
+| 2 | `SettleFunding` | NFT holder | Refresh the NFT's funding snapshot (holder-only since GH#5) |
+| 3 | `GetPositionValue` | anyone | Read-only; emits raw leg fields via `msg!` logs (read with `simulateTransaction`) |
+| 4 | `ExecuteTransferHook` | Token-2022 (CPI) | Transfer-hook gate; not called directly |
+| 5 | `EmergencyBurn` | NFT holder | Burn + release for a closed/liquidated/slot-reused position (10 accounts) |
+| 6 | `RepairExtraMetas` | anyone | Rewrite an NFT's ExtraAccountMetaList to the current layout (permissionless, deterministic) |
+
+(See the per-instruction doc-comments in `src/instruction.rs` for the exact account lists and flags.)
 
 ## PDA Seeds
 
-- **PositionNft**: `["position_nft", slab_pubkey, user_idx_le_bytes]`
-- **MintAuthority**: `["mint_authority"]` (program-wide, signs all mint operations)
+- **PositionNft**: `["position_nft", portfolio_account, market_id_le_bytes]` (keyed on the per-position `market_id`, not the reused `asset_index` — see #108)
+- **MintAuthority**: `["mint_authority"]` (program-wide; signs mint-to, mint-close, and the escrow/unwrap CPIs)
+- **ExtraAccountMetaList**: `["extra-account-metas", nft_mint]`
+- **NftRegistry** (owned by the core wrapper): `["nft_registry", market_group]` under the wrapper program id
 
-## v12.17 Layout Support
+## Portfolio layout
 
-The NFT program mirrors the v12.17 slab layout to read position state directly without CPI. The `small`, `medium`, and default (large) feature flags must match the feature used to build the deployed percolator-prog binary so that struct offsets align correctly.
+The NFT program mirrors the v17 `PortfolioAccountV16Account` layout (`src/slab_types_v16.rs`) to read position state directly without a read-CPI. The mirror is byte-exact against the engine struct; offsets are pinned by compile-time `const_assert!`s.
 
 ## Transfer Hook
 
-The transfer hook performs a health check at NFT transfer time using the last-cranked oracle price. See deferred finding C-12 for the known limitation on price staleness at transfer time.
+The Token-2022 TransferHook is a **stateless gate** — it performs no ownership reassignment and no margin/health check. On each transfer it validates: amount == 1, the caller is a genuine Token-2022 `TransferChecked`/`TransferCheckedWithFee` of this mint (#103 rejects plain `Transfer`), the source/dest ATAs, the PositionNft PDA derivation, the per-market NftRegistry, the slot-reuse anchor (`market_id`), and the leg transfer gate (active leg + not locked/stale/resolved/mid-close). Any failure rejects the transfer; the position stays escrowed regardless of where the NFT is held.
 
 ## Build and Test
 
@@ -47,19 +61,15 @@ The transfer hook performs a health check at NFT transfer time using the last-cr
 # Build BPF binary
 cargo build-sbf
 
-# Run tests — 65 tests, 0 failures
+# Unit tests (pure logic)
 cargo test
 ```
 
 ## Security Notes
 
 - `forbid(unsafe_code)` enforced
-- Slab owner verified against known Percolator program IDs (devnet + mainnet)
-- Position ownership verified before minting
-- Transfer hook enforces health check before position transfer
-- NFT burn closes PDA and returns rent to holder
-
-## Known Deferred Findings
-
-- **C-7:** The `account_id` guard is inoperative under the v12.17 layout. Impact is approximately 0.002 SOL PDA rent loss. No position or fund risk. Fix is scheduled for next upgrade.
-- **C-12:** The transfer hook uses the cached oracle price (last crank), not a fresh feed read. Bounded by keeper crank frequency. Fix requires an `ExtraAccountMeta` interface change.
+- Portfolio owner verified against the known Percolator wrapper program IDs (devnet + mainnet), fail-closed
+- Position ownership verified before minting; mint escrows the portfolio to a program PDA
+- The transfer hook gates transfers (active/clean leg, registry, market_id anchor); it reassigns no ownership
+- Per-market NftRegistry validated at mint so a minted NFT is born transferable (#109)
+- Burn/EmergencyBurn close the NFT, mint, ATA, and ExtraAccountMetaList PDAs and return rent to the holder; EmergencyBurn also recovers when the core has already closed the underlying portfolio (#131)

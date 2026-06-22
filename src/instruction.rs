@@ -14,7 +14,7 @@ use solana_program::program_error::ProgramError;
 ///   1. `[writable]`          PositionNft PDA (created)
 ///   2. `[writable, signer]`  NFT mint (Token-2022, created — fresh keypair)
 ///   3. `[writable]`          Owner's NFT token account (ATA, created)
-///   4. `[]`                  Portfolio account (read position data)
+///   4. `[writable]`          Portfolio account (escrow CPI mutates portfolio.owner — #105)
 ///   5. `[]`                  Mint authority PDA
 ///   6. `[]`                  Token-2022 program
 ///   7. `[]`                  Associated token account program
@@ -26,6 +26,9 @@ use solana_program::program_error::ProgramError;
 ///      (portfolio.owner). Mint fails (`RegistryNotConfigured`) unless it exists,
 ///      is wrapper-owned, and registers THIS NFT program — otherwise the minted
 ///      NFT would be permanently non-transferable (core B-3 transfer gate).
+///  11. `[]`                  Percolator wrapper program (escrow CPI target) — #105;
+///      Mint CPIs its B-3 `TransferPortfolioOwnership` (tag 72) to set
+///      `portfolio.owner` = this NFT program's mint-authority PDA (true custody).
 ///
 /// Data: tag(1) + asset_index(2)
 pub const TAG_MINT_POSITION_NFT: u8 = 0;
@@ -39,9 +42,12 @@ pub const TAG_MINT_POSITION_NFT: u8 = 0;
 ///   1. `[writable]`  PositionNft PDA (closed, rent returned)
 ///   2. `[writable]`  NFT mint (supply → 0)
 ///   3. `[writable]`  Holder's NFT token account (closed)
-///   4. `[]`          Slab account (verify position)
+///   4. `[writable]`  Portfolio account (escrow release CPI mutates portfolio.owner — #105)
 ///   5. `[]`          Mint authority PDA
 ///   6. `[]`          Token-2022 program
+///   7. `[writable]`  ExtraAccountMetaList PDA (closed, rent returned) — #102
+///   8. `[]`          Per-market NftRegistry PDA (read-only) — #105
+///   9. `[]`          Percolator wrapper program (UnwrapEscrowedPortfolio CPI target, tag 82) — #105
 ///
 /// Data: tag(1)
 pub const TAG_BURN_POSITION_NFT: u8 = 1;
@@ -54,7 +60,7 @@ pub const TAG_BURN_POSITION_NFT: u8 = 1;
 /// Accounts:
 ///   0. `[signer]`    NFT holder (must own the NFT via ATA)
 ///   1. `[writable]`  PositionNft PDA
-///   2. `[]`          Slab account (read current funding index)
+///   2. `[]`          Portfolio account (read current funding index)
 ///   3. `[]`          Holder's ATA (proves NFT ownership; balance must be 1)
 ///
 /// Data: tag(1)
@@ -66,7 +72,7 @@ pub const TAG_SETTLE_FUNDING: u8 = 2;
 ///
 /// Accounts:
 ///   0. `[]`  PositionNft PDA
-///   1. `[]`  Slab account
+///   1. `[]`  Portfolio account
 ///
 /// Data: tag(1)
 pub const TAG_GET_POSITION_VALUE: u8 = 3;
@@ -87,45 +93,40 @@ pub const TAG_EXECUTE_TRANSFER_HOOK: u8 = 4;
 ///   1. `[writable]`  PositionNft PDA (closed, rent returned)
 ///   2. `[writable]`  NFT mint (supply → 0)
 ///   3. `[writable]`  Holder's NFT token account (closed)
-///   4. `[]`          Slab account (verify liquidation)
+///   4. `[writable]`  Portfolio account (escrow release CPI mutates portfolio.owner — #105;
+///                    tolerated absent/closed — #131)
 ///   5. `[]`          Mint authority PDA
 ///   6. `[]`          Token-2022 program
+///   7. `[writable]`  ExtraAccountMetaList PDA (closed, rent returned) — #102
+///   8. `[]`          Per-market NftRegistry PDA (read-only) — #105
+///   9. `[]`          Percolator wrapper program (UnwrapEscrowedPortfolio CPI target, tag 82) — #105
 ///
 /// Data: tag(1)
 pub const TAG_EMERGENCY_BURN: u8 = 5;
 
 /// Tag 6: RepairExtraAccountMetas
 ///
-/// Rewrite the ExtraAccountMetaList PDA data for an existing NFT mint so
-/// its flags match the current processor's `build_extra_account_metas`
-/// output — most importantly, marking the slab account writable.
+/// Rewrite the ExtraAccountMetaList PDA data for an existing NFT mint so its
+/// entries + flags match the current `process_mint_position_nft` output. Used to
+/// repair an NFT whose ExtraAccountMetaList was written by an older program
+/// version with a different entry layout.
 ///
-/// Historical mints produced an ExtraAccountMetaList where the slab was
-/// declared read-only. That was wrong — the transfer hook CPIs into
-/// percolator-prog with `TransferOwnershipCpi` (tag 69), which mutates
-/// `Account.owner` in the slab. Without slab writable, the CPI fails with
-/// `writable privilege escalated` and every transfer bounces. Burn + remint
-/// is not a workaround: burn requires the position already be closed.
-///
-/// Permissionless by design. The only data written to the PDA is
-/// deterministic from the on-chain state of `nft_mint` + its `nft_pda`
-/// (slab, user_idx, percolator_prog_id). A caller cannot use this to forge
-/// anything — at worst they pay the tx fee to reset the PDA to its correct
-/// shape. No rent change (account is pre-sized by MintPositionNft).
+/// Permissionless by design. The only data written to the PDA is deterministic
+/// from the on-chain state of `nft_mint` and its `nft_pda` (portfolio, market_id,
+/// percolator_prog_id, registry). A caller cannot forge anything — at worst they
+/// pay the tx fee to reset the PDA to its correct (7-entry, 261-byte) shape.
 ///
 /// Accounts:
-///   0. `[signer, writable]`  Payer — tops up rent when the account grows
-///                            from a 5-entry (191-byte) layout to a 6-entry
-///                            (226-byte) layout. No-op on accounts already
-///                            sized for 6 entries.
+///   0. `[signer, writable]`  Payer — tops up rent if the account must grow to
+///                            the current 7-entry (261-byte) layout.
 ///   1. `[writable]`          ExtraAccountMetaList PDA;
 ///      seeds: `[b"extra-account-metas", nft_mint]`
-///   2. `[]`                  NFT mint (PDA seed input, no reads)
+///   2. `[]`                  NFT mint (PDA seed input)
 ///   3. `[]`                  PositionNft PDA;
-///      seeds: `[b"position_nft", slab, user_idx LE]`;
-///      read for user_idx + slab + nft_mint verification.
-///   4. `[]`                  Slab account (provides slab.key + percolator_prog_id)
-///   5. `[]`                  Mint authority PDA — entry #8 in the rewritten list
+///      seeds: `[b"position_nft", portfolio, market_id LE]` (#108);
+///      read for portfolio + nft_mint + market_id verification.
+///   4. `[]`                  Portfolio account (provides portfolio.key + market_group)
+///   5. `[]`                  Mint authority PDA
 ///   6. `[]`                  System program (rent top-up CPI)
 ///
 /// Data: tag(1)
